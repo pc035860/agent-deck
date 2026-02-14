@@ -36,6 +36,16 @@ const (
 	StatusStarting Status = "starting" // Session is being created (tmux initializing)
 )
 
+// CodexDetectionState represents codex session detection progress/state.
+type CodexDetectionState string
+
+const (
+	CodexDetectionPending   CodexDetectionState = "pending"
+	CodexDetectionConnected CodexDetectionState = "connected"
+	CodexDetectionNotFound  CodexDetectionState = "not_found"
+	CodexDetectionError     CodexDetectionState = "error"
+)
+
 const wrapperPlaceholder = "{command}"
 
 // Instance represents a single agent/shell session
@@ -77,9 +87,14 @@ type Instance struct {
 	OpenCodeStartedAt  int64     `json:"-"` // Unix millis when we started OpenCode (for session matching, not persisted)
 
 	// Codex CLI integration
-	CodexSessionID  string    `json:"codex_session_id,omitempty"`
-	CodexDetectedAt time.Time `json:"codex_detected_at,omitempty"`
-	CodexStartedAt  int64     `json:"-"` // Unix millis when we started Codex (for session matching, not persisted)
+	CodexSessionID         string              `json:"codex_session_id,omitempty"`
+	CodexDetectedAt        time.Time           `json:"codex_detected_at,omitempty"`
+	CodexDetectionState    CodexDetectionState `json:"codex_detection_state,omitempty"`
+	CodexDetectionReason   string              `json:"codex_detection_reason,omitempty"`
+	CodexDetectionAttempts int                 `json:"codex_detection_attempts,omitempty"`
+	CodexStartedAt         int64               `json:"-"` // Unix millis when we started Codex (for session matching, not persisted)
+	codexLastIdleRefresh   time.Time           // throttle codex detection while idle
+	codexWatcherRunning    bool                // avoid spawning duplicate codex watchers
 
 	// Latest user input for context (extracted from session files)
 	LatestPrompt      string    `json:"latest_prompt,omitempty"`
@@ -810,42 +825,122 @@ func (i *Instance) DetectCodexSession() {
 	i.detectCodexSessionAsync()
 }
 
+var codexQuickDetectionDelays = []time.Duration{
+	0,
+	1 * time.Second,
+	2 * time.Second,
+	4 * time.Second,
+	8 * time.Second,
+}
+
+const (
+	codexWatcherInterval     = 10 * time.Second
+	codexWatcherMaxDuration  = 10 * time.Minute
+	codexIdleRefreshInterval = 30 * time.Second
+)
+
+type codexSessionMetaLine struct {
+	Type    string `json:"type"`
+	Payload struct {
+		CWD string `json:"cwd"`
+	} `json:"payload"`
+}
+
+func (i *Instance) setCodexDetectionState(state CodexDetectionState, reason string) {
+	i.CodexDetectionState = state
+	i.CodexDetectionReason = reason
+	i.CodexDetectedAt = time.Now()
+}
+
+func (i *Instance) setCodexSession(sessionID, reason string) {
+	i.CodexSessionID = sessionID
+	i.setCodexDetectionState(CodexDetectionConnected, reason)
+	if i.tmuxSession != nil {
+		if err := i.tmuxSession.SetEnvironment("CODEX_SESSION_ID", sessionID); err != nil {
+			sessionLog.Warn("codex_set_env_failed", slog.String("error", err.Error()))
+		}
+	}
+}
+
+func (i *Instance) markCodexNotFound(reason string) {
+	i.CodexSessionID = ""
+	i.setCodexDetectionState(CodexDetectionNotFound, reason)
+}
+
+// isCodexSessionForProject checks whether a codex session file belongs to current project.
+// It uses the first session_meta line (contains payload.cwd) as authoritative mapping.
+func (i *Instance) isCodexSessionForProject(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	reader := bufio.NewReader(f)
+	line, err := reader.ReadString('\n')
+	if err != nil && err != io.EOF {
+		return false
+	}
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return false
+	}
+
+	var meta codexSessionMetaLine
+	if err := json.Unmarshal([]byte(line), &meta); err != nil {
+		return false
+	}
+	if meta.Type != "session_meta" || meta.Payload.CWD == "" {
+		return false
+	}
+	return normalizePath(meta.Payload.CWD) == normalizePath(i.ProjectPath)
+}
+
 // detectCodexSessionAsync detects the Codex session ID after startup
 // Codex stores sessions in ~/.codex/sessions/YYYY/MM/DD/*.jsonl
 // Session ID is a UUID that can be extracted from the filename
 // Since Codex has no "session list" command, we scan the filesystem
 func (i *Instance) detectCodexSessionAsync() {
-	// Brief wait for Codex to initialize
+	i.mu.Lock()
+	i.CodexDetectionAttempts = 0
+	i.CodexDetectionState = CodexDetectionPending
+	i.CodexDetectionReason = "startup"
+	i.mu.Unlock()
+
+	// Brief wait for Codex to initialize.
 	time.Sleep(1 * time.Second)
 
-	// Try up to 3 times with short delays
-	delays := []time.Duration{0, 1 * time.Second, 2 * time.Second}
-
-	for attempt, delay := range delays {
+	// Phase 1: quick attempts for immediate detection.
+	for attempt, delay := range codexQuickDetectionDelays {
 		if delay > 0 {
 			time.Sleep(delay)
 		}
+		i.mu.Lock()
+		i.CodexDetectionAttempts++
+		i.mu.Unlock()
 
-		sessionID := i.queryCodexSession()
-		if sessionID != "" {
-			i.CodexSessionID = sessionID
-			i.CodexDetectedAt = time.Now()
-
-			// Store in tmux environment for restart
-			if i.tmuxSession != nil {
-				if err := i.tmuxSession.SetEnvironment("CODEX_SESSION_ID", sessionID); err != nil {
-					sessionLog.Warn("codex_set_env_failed", slog.String("error", err.Error()))
-				}
+		sessionID := ""
+		if i.tmuxSession != nil {
+			if envID, err := i.tmuxSession.GetEnvironment("CODEX_SESSION_ID"); err == nil && envID != "" {
+				sessionID = envID
 			}
-
+		}
+		if sessionID == "" {
+			sessionID = i.queryCodexSession()
+		}
+		if sessionID != "" {
+			i.mu.Lock()
+			i.setCodexSession(sessionID, "quick_match")
+			i.mu.Unlock()
 			sessionLog.Debug("codex_session_detected", slog.String("session_id", sessionID), slog.Int("attempt", attempt+1))
 			return
 		}
 
-		sessionLog.Debug("codex_session_not_found", slog.Int("attempt", attempt+1), slog.Int("total", len(delays)))
+		sessionLog.Debug("codex_session_not_found", slog.Int("attempt", attempt+1), slog.Int("total", len(codexQuickDetectionDelays)))
 	}
 
-	sessionLog.Warn("codex_detection_failed", slog.Int("attempts", len(delays)))
+	// Phase 2: background watcher for late-persisted sessions.
+	i.startCodexWatcher()
 }
 
 // queryCodexSession scans the Codex sessions directory for the most recent session
@@ -865,8 +960,10 @@ func (i *Instance) queryCodexSession() string {
 	// UUID regex pattern
 	uuidPattern := regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
 
-	var bestMatch string
-	var bestMatchTime time.Time
+	var bestProjectMatch string
+	var bestProjectTime time.Time
+	var bestFallbackMatch string
+	var bestFallbackTime time.Time
 
 	// Walk through sessions directory (YYYY/MM/DD structure)
 	err = filepath.WalkDir(sessionsDir, func(path string, d os.DirEntry, err error) error {
@@ -891,19 +988,25 @@ func (i *Instance) queryCodexSession() string {
 			return nil
 		}
 
-		// Only consider sessions created after we started this instance
-		// This prevents picking up stale sessions from other projects
+		// Highest confidence: file's session_meta cwd exactly matches this project path.
+		if i.isCodexSessionForProject(path) {
+			if bestProjectMatch == "" || info.ModTime().After(bestProjectTime) {
+				bestProjectMatch = matches
+				bestProjectTime = info.ModTime()
+			}
+			return nil
+		}
+
+		// Fallback: recent file by mtime after session start.
 		if i.CodexStartedAt > 0 {
 			startTime := time.UnixMilli(i.CodexStartedAt)
 			if info.ModTime().Before(startTime) {
 				return nil
 			}
 		}
-
-		// Pick the most recently modified session
-		if bestMatch == "" || info.ModTime().After(bestMatchTime) {
-			bestMatch = matches
-			bestMatchTime = info.ModTime()
+		if bestFallbackMatch == "" || info.ModTime().After(bestFallbackTime) {
+			bestFallbackMatch = matches
+			bestFallbackTime = info.ModTime()
 		}
 
 		return nil
@@ -913,7 +1016,55 @@ func (i *Instance) queryCodexSession() string {
 		sessionLog.Debug("codex_scan_error", slog.String("error", err.Error()))
 	}
 
-	return bestMatch
+	if bestProjectMatch != "" {
+		return bestProjectMatch
+	}
+	return bestFallbackMatch
+}
+
+func (i *Instance) startCodexWatcher() {
+	i.mu.Lock()
+	if i.codexWatcherRunning {
+		i.mu.Unlock()
+		return
+	}
+	i.codexWatcherRunning = true
+	i.mu.Unlock()
+	go i.watchForCodexSession()
+}
+
+func (i *Instance) watchForCodexSession() {
+	defer func() {
+		i.mu.Lock()
+		i.codexWatcherRunning = false
+		i.mu.Unlock()
+	}()
+
+	deadline := time.Now().Add(codexWatcherMaxDuration)
+	for time.Now().Before(deadline) {
+		time.Sleep(codexWatcherInterval)
+		i.mu.Lock()
+		if i.CodexSessionID != "" {
+			i.mu.Unlock()
+			return
+		}
+		i.CodexDetectionAttempts++
+		i.mu.Unlock()
+
+		if sessionID := i.queryCodexSession(); sessionID != "" {
+			i.mu.Lock()
+			i.setCodexSession(sessionID, "watcher_match")
+			i.mu.Unlock()
+			sessionLog.Debug("codex_watcher_detected", slog.String("session_id", sessionID))
+			return
+		}
+	}
+
+	i.mu.Lock()
+	if i.CodexSessionID == "" {
+		i.markCodexNotFound("watcher_timeout")
+	}
+	i.mu.Unlock()
 }
 
 // UpdateCodexSession updates the Codex session ID from tmux environment
@@ -926,26 +1077,22 @@ func (i *Instance) UpdateCodexSession(excludeIDs map[string]bool) {
 	// 1. Try to read from tmux environment first (authoritative if set)
 	if i.tmuxSession != nil {
 		if sessionID, err := i.tmuxSession.GetEnvironment("CODEX_SESSION_ID"); err == nil && sessionID != "" {
-			if i.CodexSessionID != sessionID {
-				i.CodexSessionID = sessionID
-			}
-			i.CodexDetectedAt = time.Now()
+			i.setCodexSession(sessionID, "env_hit")
 		}
 	}
 
-	// 2. ALWAYS scan filesystem for most recent session
-	// Krudony fix: user may have started a NEW session - don't use stale cached ID
+	// 2. Scan filesystem for a better match (project-cwd aware).
 	if sessionID := i.queryCodexSession(); sessionID != "" {
 		if sessionID != i.CodexSessionID {
 			sessionLog.Debug("codex_session_update", slog.String("old_id", i.CodexSessionID), slog.String("new_id", sessionID))
 		}
-		i.CodexSessionID = sessionID
-		i.CodexDetectedAt = time.Now()
+		i.setCodexSession(sessionID, "fs_recent_match")
+		return
+	}
 
-		// Sync back to tmux environment for future restarts
-		if i.tmuxSession != nil && i.tmuxSession.Exists() {
-			_ = i.tmuxSession.SetEnvironment("CODEX_SESSION_ID", i.CodexSessionID)
-		}
+	// 3. Detection completed but no match found.
+	if i.CodexSessionID == "" {
+		i.markCodexNotFound("fs_no_match")
 	}
 }
 
@@ -1178,7 +1325,11 @@ func (i *Instance) Start() error {
 	// Start async session ID detection for Codex
 	// This runs in background and captures the session ID once Codex creates it
 	if i.Tool == "codex" {
-		go i.detectCodexSessionAsync()
+		if i.CodexSessionID == "" {
+			go i.detectCodexSessionAsync()
+		} else {
+			i.setCodexDetectionState(CodexDetectionConnected, "existing_session_id")
+		}
 	}
 
 	return nil
@@ -1375,6 +1526,11 @@ func (i *Instance) UpdateStatus() error {
 		currentTS := i.tmuxSession.GetCachedWindowActivity()
 		if currentTS == i.lastKnownActivity && !i.lastIdleCheck.IsZero() &&
 			time.Since(i.lastIdleCheck) < 10*time.Second {
+			// Keep Codex detection alive even while idle; codex session files may appear later.
+			if i.Tool == "codex" && time.Since(i.codexLastIdleRefresh) >= codexIdleRefreshInterval {
+				i.codexLastIdleRefresh = time.Now()
+				i.UpdateCodexSession(nil)
+			}
 			return nil // No activity detected, skip full check
 		}
 		// Activity detected OR recheck interval passed: do full check
@@ -1446,7 +1602,7 @@ func (i *Instance) UpdateStatus() error {
 		i.Tool = detectedTool
 	}
 
-	// Update session tracking only for active/waiting sessions (skip idle - nothing changes)
+	// Update session tracking for active/waiting sessions.
 	if i.Status == StatusRunning || i.Status == StatusWaiting {
 		// Update Claude session tracking (non-blocking, best-effort)
 		i.UpdateClaudeSession(nil)
@@ -1460,6 +1616,11 @@ func (i *Instance) UpdateStatus() error {
 		if i.Tool == "codex" {
 			i.UpdateCodexSession(nil)
 		}
+	} else if i.Tool == "codex" && i.Status == StatusIdle &&
+		time.Since(i.codexLastIdleRefresh) >= codexIdleRefreshInterval {
+		// Idle codex sessions still need periodic detection refresh.
+		i.codexLastIdleRefresh = time.Now()
+		i.UpdateCodexSession(nil)
 	}
 
 	return nil
@@ -2630,8 +2791,7 @@ func (i *Instance) Restart() error {
 		// Try to get session ID from tmux environment if not already set
 		if i.CodexSessionID == "" {
 			if envID, err := i.tmuxSession.GetEnvironment("CODEX_SESSION_ID"); err == nil && envID != "" {
-				i.CodexSessionID = envID
-				i.CodexDetectedAt = time.Now()
+				i.setCodexSession(envID, "restart_env_recover")
 				sessionLog.Info("restart_codex_recovered_id", slog.String("session_id", envID))
 			}
 		}
@@ -2795,6 +2955,8 @@ func (i *Instance) Restart() error {
 	// Start async session ID detection for Codex (if no ID yet)
 	if i.Tool == "codex" && i.CodexSessionID == "" {
 		go i.detectCodexSessionAsync()
+	} else if i.Tool == "codex" && i.CodexSessionID != "" {
+		i.setCodexDetectionState(CodexDetectionConnected, "restart_existing_session_id")
 	}
 
 	// Start as WAITING - will go GREEN on next tick if Claude shows busy indicator

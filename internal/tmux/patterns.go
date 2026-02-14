@@ -60,7 +60,16 @@ func DefaultRawPatterns(toolName string) *RawPatterns {
 		}
 	case "codex":
 		return &RawPatterns{
-			PromptPatterns: []string{"How can I help"},
+			BusyPatterns: []string{
+				`re:[·✳✽✶✻✢]\s*.+…`,
+				"ctrl+c to interrupt",
+				"esc to interrupt",
+			},
+			PromptPatterns: []string{
+				"How can I help",
+				"codex>",
+				"Continue?",
+			},
 		}
 	case "shell":
 		return &RawPatterns{

@@ -45,8 +45,11 @@ type jsonInstanceData struct {
 	OpenCodeSessionID  string    `json:"opencode_session_id,omitempty"`
 	OpenCodeDetectedAt time.Time `json:"opencode_detected_at,omitempty"`
 
-	CodexSessionID  string    `json:"codex_session_id,omitempty"`
-	CodexDetectedAt time.Time `json:"codex_detected_at,omitempty"`
+	CodexSessionID         string    `json:"codex_session_id,omitempty"`
+	CodexDetectedAt        time.Time `json:"codex_detected_at,omitempty"`
+	CodexDetectionState    string    `json:"codex_detection_state,omitempty"`
+	CodexDetectionReason   string    `json:"codex_detection_reason,omitempty"`
+	CodexDetectionAttempts int       `json:"codex_detection_attempts,omitempty"`
 
 	LatestPrompt    string          `json:"latest_prompt,omitempty"`
 	ToolOptionsJSON json.RawMessage `json:"tool_options,omitempty"`
@@ -64,19 +67,22 @@ type jsonGroupData struct {
 
 // toolDataBlob is the JSON structure stored in the tool_data column.
 type toolDataBlob struct {
-	ClaudeSessionID    string          `json:"claude_session_id,omitempty"`
-	ClaudeDetectedAt   int64           `json:"claude_detected_at,omitempty"`
-	GeminiSessionID    string          `json:"gemini_session_id,omitempty"`
-	GeminiDetectedAt   int64           `json:"gemini_detected_at,omitempty"`
-	GeminiYoloMode     *bool           `json:"gemini_yolo_mode,omitempty"`
-	GeminiModel        string          `json:"gemini_model,omitempty"`
-	OpenCodeSessionID  string          `json:"opencode_session_id,omitempty"`
-	OpenCodeDetectedAt int64           `json:"opencode_detected_at,omitempty"`
-	CodexSessionID     string          `json:"codex_session_id,omitempty"`
-	CodexDetectedAt    int64           `json:"codex_detected_at,omitempty"`
-	LatestPrompt       string          `json:"latest_prompt,omitempty"`
-	LoadedMCPNames     []string        `json:"loaded_mcp_names,omitempty"`
-	ToolOptions        json.RawMessage `json:"tool_options,omitempty"`
+	ClaudeSessionID        string          `json:"claude_session_id,omitempty"`
+	ClaudeDetectedAt       int64           `json:"claude_detected_at,omitempty"`
+	GeminiSessionID        string          `json:"gemini_session_id,omitempty"`
+	GeminiDetectedAt       int64           `json:"gemini_detected_at,omitempty"`
+	GeminiYoloMode         *bool           `json:"gemini_yolo_mode,omitempty"`
+	GeminiModel            string          `json:"gemini_model,omitempty"`
+	OpenCodeSessionID      string          `json:"opencode_session_id,omitempty"`
+	OpenCodeDetectedAt     int64           `json:"opencode_detected_at,omitempty"`
+	CodexSessionID         string          `json:"codex_session_id,omitempty"`
+	CodexDetectedAt        int64           `json:"codex_detected_at,omitempty"`
+	CodexDetectionState    string          `json:"codex_detection_state,omitempty"`
+	CodexDetectionReason   string          `json:"codex_detection_reason,omitempty"`
+	CodexDetectionAttempts int             `json:"codex_detection_attempts,omitempty"`
+	LatestPrompt           string          `json:"latest_prompt,omitempty"`
+	LoadedMCPNames         []string        `json:"loaded_mcp_names,omitempty"`
+	ToolOptions            json.RawMessage `json:"tool_options,omitempty"`
 }
 
 // MigrateFromJSON reads a sessions.json file and inserts all data into the StateDB.
@@ -96,15 +102,18 @@ func MigrateFromJSON(jsonPath string, db *StateDB) (int, int, error) {
 	rows := make([]*InstanceRow, 0, len(storage.Instances))
 	for _, inst := range storage.Instances {
 		td := toolDataBlob{
-			ClaudeSessionID:   inst.ClaudeSessionID,
-			GeminiSessionID:   inst.GeminiSessionID,
-			GeminiYoloMode:    inst.GeminiYoloMode,
-			GeminiModel:       inst.GeminiModel,
-			OpenCodeSessionID: inst.OpenCodeSessionID,
-			CodexSessionID:    inst.CodexSessionID,
-			LatestPrompt:      inst.LatestPrompt,
-			LoadedMCPNames:    inst.LoadedMCPNames,
-			ToolOptions:       inst.ToolOptionsJSON,
+			ClaudeSessionID:        inst.ClaudeSessionID,
+			GeminiSessionID:        inst.GeminiSessionID,
+			GeminiYoloMode:         inst.GeminiYoloMode,
+			GeminiModel:            inst.GeminiModel,
+			OpenCodeSessionID:      inst.OpenCodeSessionID,
+			CodexSessionID:         inst.CodexSessionID,
+			CodexDetectionState:    inst.CodexDetectionState,
+			CodexDetectionReason:   inst.CodexDetectionReason,
+			CodexDetectionAttempts: inst.CodexDetectionAttempts,
+			LatestPrompt:           inst.LatestPrompt,
+			LoadedMCPNames:         inst.LoadedMCPNames,
+			ToolOptions:            inst.ToolOptionsJSON,
 		}
 		if !inst.ClaudeDetectedAt.IsZero() {
 			td.ClaudeDetectedAt = inst.ClaudeDetectedAt.Unix()
@@ -178,19 +187,23 @@ func MarshalToolData(
 	geminiYoloMode *bool, geminiModel string,
 	openCodeSessionID string, openCodeDetectedAt time.Time,
 	codexSessionID string, codexDetectedAt time.Time,
+	codexDetectionState string, codexDetectionReason string, codexDetectionAttempts int,
 	latestPrompt string, loadedMCPNames []string,
 	toolOptionsJSON json.RawMessage,
 ) json.RawMessage {
 	td := toolDataBlob{
-		ClaudeSessionID:   claudeSessionID,
-		GeminiSessionID:   geminiSessionID,
-		GeminiYoloMode:    geminiYoloMode,
-		GeminiModel:       geminiModel,
-		OpenCodeSessionID: openCodeSessionID,
-		CodexSessionID:    codexSessionID,
-		LatestPrompt:      latestPrompt,
-		LoadedMCPNames:    loadedMCPNames,
-		ToolOptions:       toolOptionsJSON,
+		ClaudeSessionID:        claudeSessionID,
+		GeminiSessionID:        geminiSessionID,
+		GeminiYoloMode:         geminiYoloMode,
+		GeminiModel:            geminiModel,
+		OpenCodeSessionID:      openCodeSessionID,
+		CodexSessionID:         codexSessionID,
+		CodexDetectionState:    codexDetectionState,
+		CodexDetectionReason:   codexDetectionReason,
+		CodexDetectionAttempts: codexDetectionAttempts,
+		LatestPrompt:           latestPrompt,
+		LoadedMCPNames:         loadedMCPNames,
+		ToolOptions:            toolOptionsJSON,
 	}
 	if !claudeDetectedAt.IsZero() {
 		td.ClaudeDetectedAt = claudeDetectedAt.Unix()
@@ -216,6 +229,7 @@ func UnmarshalToolData(data json.RawMessage) (
 	geminiYoloMode *bool, geminiModel string,
 	openCodeSessionID string, openCodeDetectedAt time.Time,
 	codexSessionID string, codexDetectedAt time.Time,
+	codexDetectionState string, codexDetectionReason string, codexDetectionAttempts int,
 	latestPrompt string, loadedMCPNames []string,
 	toolOptionsJSON json.RawMessage,
 ) {
@@ -244,6 +258,9 @@ func UnmarshalToolData(data json.RawMessage) (
 	if td.CodexDetectedAt > 0 {
 		codexDetectedAt = time.Unix(td.CodexDetectedAt, 0)
 	}
+	codexDetectionState = td.CodexDetectionState
+	codexDetectionReason = td.CodexDetectionReason
+	codexDetectionAttempts = td.CodexDetectionAttempts
 	latestPrompt = td.LatestPrompt
 	loadedMCPNames = td.LoadedMCPNames
 	toolOptionsJSON = td.ToolOptions

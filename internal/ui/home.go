@@ -376,6 +376,15 @@ type openCodeDetectionCompleteMsg struct {
 	sessionID  string // The detected session ID (may be empty if detection failed)
 }
 
+// codexDetectionCompleteMsg signals that Codex session detection finished.
+type codexDetectionCompleteMsg struct {
+	instanceID      string
+	sessionID       string
+	detectionState  session.CodexDetectionState
+	detectionReason string
+	detectedAt      time.Time
+}
+
 type updateCheckMsg struct {
 	info *update.UpdateInfo
 }
@@ -1435,6 +1444,24 @@ func (h *Home) detectOpenCodeSessionCmd(inst *session.Instance) tea.Cmd {
 	}
 }
 
+// detectCodexSessionCmd returns a command that asynchronously detects the Codex session ID.
+func (h *Home) detectCodexSessionCmd(inst *session.Instance) tea.Cmd {
+	if inst == nil {
+		return nil
+	}
+	instanceID := inst.ID
+	return func() tea.Msg {
+		inst.DetectCodexSession()
+		return codexDetectionCompleteMsg{
+			instanceID:      instanceID,
+			sessionID:       inst.CodexSessionID,
+			detectionState:  inst.CodexDetectionState,
+			detectionReason: inst.CodexDetectionReason,
+			detectedAt:      inst.CodexDetectedAt,
+		}
+	}
+}
+
 // getAnalyticsForSession returns cached analytics if still valid (within TTL)
 // Returns nil if cache miss or expired, triggering async fetch
 func (h *Home) getAnalyticsForSession(inst *session.Instance) *session.SessionAnalytics {
@@ -2136,12 +2163,17 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Deduplicate Claude session IDs on load to fix any existing duplicates
 			// This ensures no two sessions share the same Claude session ID
 			session.UpdateClaudeSessionsWithDedup(h.instances)
-			// Collect OpenCode detection commands for restored sessions without IDs
-			// Using tea.Cmd pattern ensures save is triggered after detection completes
+			// Collect async detection commands for restored sessions without IDs.
+			// Using tea.Cmd ensures save is triggered after detection completes.
 			var detectionCmds []tea.Cmd
 			for _, inst := range h.instances {
 				if inst.Tool == "opencode" && inst.OpenCodeSessionID == "" {
 					detectionCmds = append(detectionCmds, h.detectOpenCodeSessionCmd(inst))
+				}
+				if inst.Tool == "codex" &&
+					inst.CodexSessionID == "" &&
+					inst.CodexDetectionState != session.CodexDetectionConnected {
+					detectionCmds = append(detectionCmds, h.detectCodexSessionCmd(inst))
 				}
 			}
 			h.instancesMu.Unlock()
@@ -2519,6 +2551,18 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// CRITICAL: Force save to persist the detected session ID to storage
 		// This uses forceSaveInstances() to bypass isReloading check, preventing
 		// the race condition where detection completes during a storage watcher reload
+		h.forceSaveInstances()
+		return h, nil
+
+	case codexDetectionCompleteMsg:
+		if inst := h.getInstanceByID(msg.instanceID); inst != nil {
+			inst.CodexSessionID = msg.sessionID
+			inst.CodexDetectionState = msg.detectionState
+			inst.CodexDetectionReason = msg.detectionReason
+			inst.CodexDetectedAt = msg.detectedAt
+		} else {
+			uiLog.Warn("codex_instance_not_found", slog.String("instance_id", msg.instanceID))
+		}
 		h.forceSaveInstances()
 		return h, nil
 
@@ -6219,6 +6263,38 @@ func renderToolStatusLine(b *strings.Builder, sessionID string, detectedAt time.
 	}
 }
 
+func renderCodexStatusLine(b *strings.Builder, sessionID string, detectedAt time.Time, state session.CodexDetectionState) {
+	labelStyle := lipgloss.NewStyle().Foreground(ColorText)
+	valueStyle := lipgloss.NewStyle().Foreground(ColorText)
+
+	if sessionID != "" || state == session.CodexDetectionConnected {
+		statusStyle := lipgloss.NewStyle().Foreground(ColorGreen).Bold(true)
+		b.WriteString(labelStyle.Render("Status:  "))
+		b.WriteString(statusStyle.Render("● Connected"))
+		b.WriteString("\n")
+
+		if sessionID != "" {
+			b.WriteString(labelStyle.Render("Session: "))
+			b.WriteString(valueStyle.Render(sessionID))
+			b.WriteString("\n")
+		}
+		return
+	}
+
+	if state == session.CodexDetectionPending || (state == "" && detectedAt.IsZero()) {
+		statusStyle := lipgloss.NewStyle().Foreground(ColorYellow)
+		b.WriteString(labelStyle.Render("Status:  "))
+		b.WriteString(statusStyle.Render("◐ Detecting session..."))
+		b.WriteString("\n")
+		return
+	}
+
+	statusStyle := lipgloss.NewStyle().Foreground(ColorText)
+	b.WriteString(labelStyle.Render("Status:  "))
+	b.WriteString(statusStyle.Render("○ No session found"))
+	b.WriteString("\n")
+}
+
 // renderDetectedAtLine renders a "Detected: X ago" line.
 func renderDetectedAtLine(b *strings.Builder, detectedAt time.Time) {
 	if detectedAt.IsZero() {
@@ -7646,7 +7722,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		b.WriteString(codexHeader)
 		b.WriteString("\n")
 
-		renderToolStatusLine(&b, selected.CodexSessionID, selected.CodexDetectedAt, true)
+		renderCodexStatusLine(&b, selected.CodexSessionID, selected.CodexDetectedAt, selected.CodexDetectionState)
 		if selected.CodexSessionID != "" {
 			renderDetectedAtLine(&b, selected.CodexDetectedAt)
 		}
