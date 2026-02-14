@@ -94,6 +94,7 @@ type Instance struct {
 	CodexDetectionAttempts int                 `json:"codex_detection_attempts,omitempty"`
 	CodexStartedAt         int64               `json:"-"` // Unix millis when we started Codex (for session matching, not persisted)
 	codexLastIdleRefresh   time.Time           // throttle codex detection while idle
+	codexLastFSScan        time.Time           // throttle codex filesystem scans while session ID is stable
 	codexWatcherRunning    bool                // avoid spawning duplicate codex watchers
 
 	// Latest user input for context (extracted from session files)
@@ -827,17 +828,19 @@ func (i *Instance) DetectCodexSession() {
 
 var codexQuickDetectionDelays = []time.Duration{
 	0,
-	1 * time.Second,
 	2 * time.Second,
-	4 * time.Second,
-	8 * time.Second,
+	5 * time.Second,
 }
 
 const (
 	codexWatcherInterval     = 10 * time.Second
 	codexWatcherMaxDuration  = 10 * time.Minute
-	codexIdleRefreshInterval = 30 * time.Second
+	codexIdleRefreshInterval = 2 * time.Minute
+	codexFSRescanInterval    = 45 * time.Second
+	codexRecentScanDays      = 2
 )
+
+var codexUUIDPattern = regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
 
 type codexSessionMetaLine struct {
 	Type    string `json:"type"`
@@ -853,13 +856,42 @@ func (i *Instance) setCodexDetectionState(state CodexDetectionState, reason stri
 }
 
 func (i *Instance) setCodexSession(sessionID, reason string) {
+	if sessionID == "" {
+		return
+	}
+	sameID := i.CodexSessionID == sessionID
 	i.CodexSessionID = sessionID
 	i.setCodexDetectionState(CodexDetectionConnected, reason)
-	if i.tmuxSession != nil {
+	shouldSyncEnv := !sameID || reason != "env_hit"
+	if shouldSyncEnv && i.tmuxSession != nil {
 		if err := i.tmuxSession.SetEnvironment("CODEX_SESSION_ID", sessionID); err != nil {
 			sessionLog.Warn("codex_set_env_failed", slog.String("error", err.Error()))
 		}
 	}
+}
+
+func listRecentCodexSessionFiles(sessionsDir string, days int) []string {
+	if days <= 0 {
+		days = 1
+	}
+
+	files := make([]string, 0, days*16)
+	now := time.Now()
+	for dayOffset := 0; dayOffset < days; dayOffset++ {
+		d := now.AddDate(0, 0, -dayOffset)
+		dayDir := filepath.Join(
+			sessionsDir,
+			fmt.Sprintf("%04d", d.Year()),
+			fmt.Sprintf("%02d", int(d.Month())),
+			fmt.Sprintf("%02d", d.Day()),
+		)
+		matches, err := filepath.Glob(filepath.Join(dayDir, "*.jsonl"))
+		if err != nil || len(matches) == 0 {
+			continue
+		}
+		files = append(files, matches...)
+	}
+	return files
 }
 
 func (i *Instance) markCodexNotFound(reason string) {
@@ -957,35 +989,23 @@ func (i *Instance) queryCodexSession() string {
 		return ""
 	}
 
-	// UUID regex pattern
-	uuidPattern := regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
-
 	var bestProjectMatch string
 	var bestProjectTime time.Time
 	var bestFallbackMatch string
 	var bestFallbackTime time.Time
 
-	// Walk through sessions directory (YYYY/MM/DD structure)
-	err = filepath.WalkDir(sessionsDir, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil // Skip errors
-		}
-
-		// Only process .jsonl files
-		if d.IsDir() || !strings.HasSuffix(d.Name(), ".jsonl") {
-			return nil
-		}
-
+	candidateFiles := listRecentCodexSessionFiles(sessionsDir, codexRecentScanDays)
+	for _, path := range candidateFiles {
 		// Extract UUID from filename
-		matches := uuidPattern.FindString(d.Name())
+		matches := codexUUIDPattern.FindString(filepath.Base(path))
 		if matches == "" {
-			return nil
+			continue
 		}
 
 		// Get file info for modification time
-		info, err := d.Info()
+		info, err := os.Stat(path)
 		if err != nil {
-			return nil
+			continue
 		}
 
 		// Highest confidence: file's session_meta cwd exactly matches this project path.
@@ -994,26 +1014,20 @@ func (i *Instance) queryCodexSession() string {
 				bestProjectMatch = matches
 				bestProjectTime = info.ModTime()
 			}
-			return nil
+			continue
 		}
 
 		// Fallback: recent file by mtime after session start.
 		if i.CodexStartedAt > 0 {
 			startTime := time.UnixMilli(i.CodexStartedAt)
 			if info.ModTime().Before(startTime) {
-				return nil
+				continue
 			}
 		}
 		if bestFallbackMatch == "" || info.ModTime().After(bestFallbackTime) {
 			bestFallbackMatch = matches
 			bestFallbackTime = info.ModTime()
 		}
-
-		return nil
-	})
-
-	if err != nil {
-		sessionLog.Debug("codex_scan_error", slog.String("error", err.Error()))
 	}
 
 	if bestProjectMatch != "" {
@@ -1075,13 +1089,25 @@ func (i *Instance) UpdateCodexSession(excludeIDs map[string]bool) {
 	}
 
 	// 1. Try to read from tmux environment first (authoritative if set)
+	envSessionID := ""
 	if i.tmuxSession != nil {
 		if sessionID, err := i.tmuxSession.GetEnvironment("CODEX_SESSION_ID"); err == nil && sessionID != "" {
+			envSessionID = sessionID
 			i.setCodexSession(sessionID, "env_hit")
 		}
 	}
 
-	// 2. Scan filesystem for a better match (project-cwd aware).
+	// 2. Skip expensive filesystem scan if current ID is stable and we scanned recently.
+	shouldScanFS := i.CodexSessionID == ""
+	if !shouldScanFS && time.Since(i.codexLastFSScan) >= codexFSRescanInterval {
+		shouldScanFS = true
+	}
+	if !shouldScanFS {
+		return
+	}
+
+	// 3. Scan filesystem for a better match (project-cwd aware).
+	i.codexLastFSScan = time.Now()
 	if sessionID := i.queryCodexSession(); sessionID != "" {
 		if sessionID != i.CodexSessionID {
 			sessionLog.Debug("codex_session_update", slog.String("old_id", i.CodexSessionID), slog.String("new_id", sessionID))
@@ -1090,8 +1116,9 @@ func (i *Instance) UpdateCodexSession(excludeIDs map[string]bool) {
 		return
 	}
 
-	// 3. Detection completed but no match found.
-	if i.CodexSessionID == "" {
+	// 4. Detection completed but no match found.
+	// If tmux env already had an ID, keep it and skip not_found transition.
+	if i.CodexSessionID == "" && envSessionID == "" {
 		i.markCodexNotFound("fs_no_match")
 	}
 }
