@@ -548,8 +548,12 @@ func (s *Session) shouldHoldActiveOnPromptLocked() bool {
 	if s.stateTracker == nil || s.lastStableStatus != "active" {
 		return false
 	}
-	const promptNoBusyHoldPolls = 2
-	if s.stateTracker.promptNoBusyCount < promptNoBusyHoldPolls {
+	holdPolls := 2
+	tool := inferToolFromSessionFields(s.detectedTool, s.customToolName, s.Command)
+	if strings.EqualFold(tool, "codex") {
+		holdPolls = 4
+	}
+	if s.stateTracker.promptNoBusyCount < holdPolls {
 		s.stateTracker.promptNoBusyCount++
 		return true
 	}

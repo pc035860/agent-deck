@@ -1612,6 +1612,11 @@ func (i *Instance) UpdateStatus() error {
 	switch status {
 	case "active":
 		i.Status = StatusRunning
+		// Codex-only: clear stale acknowledgment immediately while actively running.
+		// This prevents transient busy misses from mapping straight to IDLE.
+		if i.Tool == "codex" && i.tmuxSession != nil {
+			i.tmuxSession.ApplySharedAcknowledged(false)
+		}
 	case "waiting":
 		i.Status = StatusWaiting
 	case "idle":
@@ -3389,12 +3394,12 @@ func (i *Instance) GetTmuxSession() *tmux.Session {
 	return i.tmuxSession
 }
 
-// SetAcknowledgedFromShared applies an acknowledgment from another TUI instance
-// (read from SQLite). This transitions a YELLOW (waiting) session to GRAY (idle)
-// without requiring the user to interact with this specific TUI instance.
+// SetAcknowledgedFromShared applies acknowledgment state from another TUI instance
+// (read from SQLite). Unlike Acknowledge/ResetAcknowledged, this only syncs the
+// acknowledgment flag and lets GetStatus decide waiting/idle naturally.
 func (i *Instance) SetAcknowledgedFromShared(ack bool) {
-	if ack && i.tmuxSession != nil {
-		i.tmuxSession.Acknowledge()
+	if i.tmuxSession != nil {
+		i.tmuxSession.ApplySharedAcknowledged(ack)
 	}
 }
 

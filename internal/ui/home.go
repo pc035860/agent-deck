@@ -1785,7 +1785,22 @@ func (h *Home) backgroundStatusUpdate() {
 		// Read acknowledgments from SQLite (picks up acks from other instances)
 		if ackStatuses, err := db.ReadAllStatuses(); err == nil {
 			for _, inst := range instances {
-				if s, ok := ackStatuses[inst.ID]; ok && s.Acknowledged {
+				s, ok := ackStatuses[inst.ID]
+				if !ok {
+					continue
+				}
+
+				// Codex-only: if session is actively running, stale ack=true can cause
+				// transient busy misses to map to IDLE. Clear it once in DB.
+				if inst.Tool == "codex" &&
+					inst.GetStatusThreadSafe() == session.StatusRunning &&
+					s.Acknowledged {
+					inst.SetAcknowledgedFromShared(false)
+					_ = db.SetAcknowledged(inst.ID, false)
+					continue
+				}
+
+				if s.Acknowledged {
 					inst.SetAcknowledgedFromShared(true)
 				}
 			}
