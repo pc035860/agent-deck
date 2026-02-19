@@ -20,12 +20,24 @@ install: build
 	@echo "Run 'agent-deck' to start"
 
 # Install to user's local bin (no sudo required)
+# Supports symlink-based version switching: installs as agent-deck-local
+# and creates symlink if not already present
 install-user: build
 	mkdir -p $(HOME)/.local/bin
-	cp $(BUILD_DIR)/$(BINARY_NAME) $(HOME)/.local/bin/$(BINARY_NAME)
-	@echo "✅ Installed to $(HOME)/.local/bin/$(BINARY_NAME)"
+	cp $(BUILD_DIR)/$(BINARY_NAME) $(HOME)/.local/bin/$(BINARY_NAME)-local
+	@if [ -L $(HOME)/.local/bin/$(BINARY_NAME) ]; then \
+		echo "✅ Updated $(HOME)/.local/bin/$(BINARY_NAME)-local"; \
+		current=$$(readlink $(HOME)/.local/bin/$(BINARY_NAME) | xargs basename); \
+		if [ "$$current" = "$(BINARY_NAME)-local" ]; then \
+			echo "   Symlink active: local (current)"; \
+		else \
+			echo "   Symlink active: $$current (run 'agent-deck-switch local' to activate)"; \
+		fi; \
+	else \
+		ln -sf $(HOME)/.local/bin/$(BINARY_NAME)-local $(HOME)/.local/bin/$(BINARY_NAME); \
+		echo "✅ Installed to $(HOME)/.local/bin/$(BINARY_NAME) -> $(BINARY_NAME)-local"; \
+	fi
 	@echo "Make sure $(HOME)/.local/bin is in your PATH"
-	@echo "Run 'agent-deck' to start"
 
 # Uninstall from /usr/local/bin
 uninstall:
