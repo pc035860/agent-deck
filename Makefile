@@ -37,6 +37,8 @@ install-user: build
 		ln -sf $(HOME)/.local/bin/$(BINARY_NAME)-local $(HOME)/.local/bin/$(BINARY_NAME); \
 		echo "✅ Installed to $(HOME)/.local/bin/$(BINARY_NAME) -> $(BINARY_NAME)-local"; \
 	fi
+	cp agent-deck-switch.sh $(HOME)/.local/bin/$(BINARY_NAME)-switch
+	chmod +x $(HOME)/.local/bin/$(BINARY_NAME)-switch
 	@echo "Make sure $(HOME)/.local/bin is in your PATH"
 
 # Uninstall from /usr/local/bin
