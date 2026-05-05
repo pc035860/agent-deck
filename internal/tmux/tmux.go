@@ -2753,7 +2753,7 @@ func (s *Session) GetStatus() (string, error) {
 			s.mu.Lock()
 			s.ensureStateTrackerLocked()
 			s.stateTracker.lastChangeTime = time.Now()
-			s.stateTracker.acknowledged = false
+			s.resetAcknowledgedForActivityLocked()
 			s.resetPromptNoBusyHoldLocked()
 			s.stateTracker.spinnerTracker.MarkBusy()
 			s.lastStableStatus = "active"
@@ -2849,7 +2849,7 @@ func (s *Session) GetStatus() (string, error) {
 			// false "waiting" detection during tool transitions.
 			if isExplicitlyBusy {
 				s.stateTracker.lastChangeTime = time.Now()
-				s.stateTracker.acknowledged = false
+				s.resetAcknowledgedForActivityLocked()
 				s.resetPromptNoBusyHoldLocked()
 				s.stateTracker.lastActivityTimestamp = currentTS
 				s.lastStableStatus = "active"
@@ -2995,7 +2995,7 @@ func (s *Session) GetStatus() (string, error) {
 					// terminal redraws, and status bar updates can cause hash changes
 					if isExplicitlyBusy {
 						s.stateTracker.lastChangeTime = now
-						s.stateTracker.acknowledged = false
+						s.resetAcknowledgedForActivityLocked()
 						s.resetPromptNoBusyHoldLocked()
 						s.stateTracker.activityCheckStart = time.Time{} // Reset window
 						s.stateTracker.activityChangeCount = 0
@@ -3193,7 +3193,7 @@ func (s *Session) getStatusFallback() (string, error) {
 		defer s.mu.Unlock()
 		s.ensureStateTrackerLocked()
 		s.stateTracker.lastChangeTime = time.Now()
-		s.stateTracker.acknowledged = false
+		s.resetAcknowledgedForActivityLocked()
 		s.resetPromptNoBusyHoldLocked()
 		s.lastStableStatus = "active"
 		s.startupAt = time.Time{}
@@ -3317,6 +3317,7 @@ func (s *Session) Acknowledge() {
 
 	s.ensureStateTrackerLocked()
 	s.stateTracker.acknowledged = true
+	s.stateTracker.acknowledgedAt = time.Now()
 	s.resetPromptNoBusyHoldLocked()
 	s.lastStableStatus = "idle"
 }
@@ -3333,6 +3334,37 @@ func (s *Session) ResetAcknowledged() {
 	s.resetPromptNoBusyHoldLocked()
 	s.stateTracker.waitingSince = time.Now() // Track when session became waiting for ordering
 	s.lastStableStatus = "waiting"
+}
+
+// ackActivityGraceWindow is the short window after Acknowledge() during which
+// tmux-detected activity noise (busy indicator, spinner, sustained activity,
+// fallback busy) MUST NOT clear the acknowledged flag. This protects the
+// "user attached briefly to look, then detached" case from being flipped back
+// to waiting by transient redraws (context counter, status bar animation, etc.)
+// happening while the user is viewing the session.
+//
+// Hook lifecycle events ("running") and explicit attention events
+// (PermissionRequest, Notification, manual `u`, cold-load stale) MUST keep
+// using ResetAcknowledged() — they are authoritative signals, not noise.
+const ackActivityGraceWindow = 2 * time.Second
+
+// resetAcknowledgedForActivityLocked is the soft reset used by tmux-detected
+// activity-noise paths. Caller MUST hold s.mu and MUST have called
+// ensureStateTrackerLocked() (or equivalent). Returns true if the reset was
+// applied, false if it was suppressed by the grace window. Callers do not
+// need to use the return value in production — it exists for tests.
+//
+// This helper deliberately touches only the acknowledged flag. Other state
+// (lastChangeTime, lastStableStatus, lastActivityTimestamp, etc.) is the
+// caller's responsibility and remains correct whether the reset was applied
+// or suppressed.
+func (s *Session) resetAcknowledgedForActivityLocked() bool {
+	if !s.stateTracker.acknowledgedAt.IsZero() &&
+		time.Since(s.stateTracker.acknowledgedAt) <= ackActivityGraceWindow {
+		return false
+	}
+	s.stateTracker.acknowledged = false
+	return true
 }
 
 // ApplySharedAcknowledged applies acknowledgment state replicated from SQLite.

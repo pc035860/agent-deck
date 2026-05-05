@@ -838,6 +838,128 @@ func TestAcknowledge(t *testing.T) {
 	}
 }
 
+// TestAcknowledge_WritesAcknowledgedAt verifies Acknowledge() records the
+// timestamp used by the activity-noise grace window.
+func TestAcknowledge_WritesAcknowledgedAt(t *testing.T) {
+	sess := NewSession("test", "/tmp")
+	sess.stateTracker = &StateTracker{}
+
+	if !sess.stateTracker.acknowledgedAt.IsZero() {
+		t.Fatal("acknowledgedAt should start as zero")
+	}
+
+	before := time.Now()
+	sess.Acknowledge()
+	after := time.Now()
+
+	if sess.stateTracker.acknowledgedAt.IsZero() {
+		t.Fatal("acknowledgedAt should be set after Acknowledge()")
+	}
+	if sess.stateTracker.acknowledgedAt.Before(before) || sess.stateTracker.acknowledgedAt.After(after) {
+		t.Errorf("acknowledgedAt = %v not within [%v, %v]", sess.stateTracker.acknowledgedAt, before, after)
+	}
+}
+
+// TestResetAcknowledgedForActivity_WithinGrace verifies that the soft reset
+// used by tmux activity-noise paths is suppressed during the grace window.
+// This is the core fix for "waiting status doesn't clear after attach→detach":
+// transient redraws (context counter, status bar) while the user is viewing
+// must not flip the acknowledged flag back to false.
+func TestResetAcknowledgedForActivity_WithinGrace(t *testing.T) {
+	sess := NewSession("test", "/tmp")
+	sess.stateTracker = &StateTracker{}
+
+	sess.Acknowledge()
+	if !sess.stateTracker.acknowledged {
+		t.Fatal("precondition: acknowledged should be true after Acknowledge()")
+	}
+
+	sess.mu.Lock()
+	applied := sess.resetAcknowledgedForActivityLocked()
+	sess.mu.Unlock()
+
+	if applied {
+		t.Error("resetAcknowledgedForActivityLocked should return false within grace window")
+	}
+	if !sess.stateTracker.acknowledged {
+		t.Error("acknowledged must remain true within grace window")
+	}
+}
+
+// TestResetAcknowledgedForActivity_AfterGrace verifies that the soft reset
+// fires normally once the grace window has elapsed.
+func TestResetAcknowledgedForActivity_AfterGrace(t *testing.T) {
+	sess := NewSession("test", "/tmp")
+	sess.stateTracker = &StateTracker{}
+
+	sess.Acknowledge()
+	// Backdate the timestamp past the grace window without sleeping in the test.
+	sess.mu.Lock()
+	sess.stateTracker.acknowledgedAt = time.Now().Add(-(ackActivityGraceWindow + time.Second))
+	applied := sess.resetAcknowledgedForActivityLocked()
+	sess.mu.Unlock()
+
+	if !applied {
+		t.Error("resetAcknowledgedForActivityLocked should return true after grace window")
+	}
+	if sess.stateTracker.acknowledged {
+		t.Error("acknowledged must be cleared after grace window")
+	}
+}
+
+// TestResetAcknowledged_IgnoresGrace verifies that the hard reset path used by
+// hook lifecycle events ("running") and explicit attention events
+// (PermissionRequest, Notification, manual `u`, cold-load) is NEVER suppressed
+// by the grace window. This guards against the v2 "real work eaten by grace"
+// regression: if a user attaches and then immediately sends a prompt, the
+// completion must still surface as waiting (not idle).
+func TestResetAcknowledged_IgnoresGrace(t *testing.T) {
+	sess := NewSession("test", "/tmp")
+	sess.stateTracker = &StateTracker{}
+
+	sess.Acknowledge()
+	if !sess.stateTracker.acknowledged {
+		t.Fatal("precondition: acknowledged should be true after Acknowledge()")
+	}
+
+	// Even immediately within the grace window, ResetAcknowledged must clear it.
+	sess.ResetAcknowledged()
+
+	if sess.stateTracker.acknowledged {
+		t.Error("ResetAcknowledged() must always clear acknowledged, even within grace window")
+	}
+	if sess.lastStableStatus != "waiting" {
+		t.Errorf("ResetAcknowledged() should set lastStableStatus=waiting, got %q", sess.lastStableStatus)
+	}
+}
+
+// TestResetAcknowledgedForActivity_ZeroTimestamp verifies that a session with
+// no recorded acknowledgedAt (e.g., loaded from SQLite via ReconnectSessionLazy
+// without a fresh Acknowledge() call) is not protected by the grace window.
+// Without this, daemon restart or reconnect would leave sessions in a
+// permanently-acknowledged state until the next Acknowledge().
+func TestResetAcknowledgedForActivity_ZeroTimestamp(t *testing.T) {
+	sess := NewSession("test", "/tmp")
+	// Manually set acknowledged=true without going through Acknowledge(),
+	// simulating a stale flag with no timestamp (reconnect scenario).
+	sess.stateTracker = &StateTracker{acknowledged: true}
+
+	if !sess.stateTracker.acknowledgedAt.IsZero() {
+		t.Fatal("precondition: acknowledgedAt must be zero for this test")
+	}
+
+	sess.mu.Lock()
+	applied := sess.resetAcknowledgedForActivityLocked()
+	sess.mu.Unlock()
+
+	if !applied {
+		t.Error("resetAcknowledgedForActivityLocked must apply when acknowledgedAt is zero")
+	}
+	if sess.stateTracker.acknowledged {
+		t.Error("acknowledged should be cleared when grace window is not active")
+	}
+}
+
 // TestHashContent verifies hash generation is consistent
 func TestHashContent(t *testing.T) {
 	sess := NewSession("test", "/tmp")
